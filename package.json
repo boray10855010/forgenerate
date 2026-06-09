@@ -1,0 +1,15 @@
+{
+  "name": "ai-image-chat",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AI Image Chat - 串聯 LM Studio 與 Stability Matrix 的 LLM 產圖應用",
+  "scripts": {
+    "install:all": "cd mcp-server-stability && npm install && cd ../backend && npm install",
+    "build:mcp": "cd mcp-server-stability && npm run build",
+    "start:backend": "cd backend && npm start",
+    "start:backend:dev": "cd backend && npm run dev",
+    "start:frontend": "npx serve frontend/public -l 5500",
+    "start": "npm run start:backend",
+    "dev": "npm run start:backend:dev"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "ai-image-chat-backend",
+  "type": "module",
+  "version": "1.0.0",
+  "description": "Backend server connecting LM Studio with MCP Stability Matrix and frontend chat",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.0",
+    "uuid": "^9.0.0"
+  }
+}

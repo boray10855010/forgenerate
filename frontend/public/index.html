@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Image Chat - LLM 產圖助手</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🎨 AI Image Chat</h1>
+            <p class="subtitle">與 AI 對話，即可生成圖片</p>
+            <div class="status-bar">
+                <span id="lmStatus" class="status-dot offline"></span>
+                <span>LM Studio</span>
+                <span id="mcpStatus" class="status-dot offline"></span>
+                <span>Stability Matrix</span>
+                <button id="clearBtn" class="btn-small">清除對話</button>
+            </div>
+        </header>
+
+        <main>
+            <div id="chatMessages" class="chat-messages">
+                <div class="message system">
+                    <div class="message-content">
+                        👋 你好！我是 AI 繪圖助手。你可以直接跟我聊天，或者說「畫一張...」來生成圖片。
+                    </div>
+                </div>
+            </div>
+
+            <div id="loadingIndicator" class="loading hidden">
+                <div class="spinner"></div>
+                <span>AI 正在思考...</span>
+            </div>
+
+            <div class="input-area">
+                <textarea id="messageInput" placeholder="輸入訊息...（例如：畫一隻可愛的貓咪）" rows="2"></textarea>
+                <button id="sendBtn" class="btn-primary">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M22 2L11 13"></path>
+                        <path d="M22 2L15 22L11 13L2 9L22 2Z"></path>
+                    </svg>
+                </button>
+            </div>
+        </main>
+
+        <footer>
+            <p>需要 LM Studio（localhost:1234）+ Stability Matrix（localhost:7860）</p>
+        </footer>
+    </div>
+
+    <div id="imageModal" class="modal hidden">
+        <span class="modal-close">&times;</span>
+        <img class="modal-content" id="modalImage">
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
