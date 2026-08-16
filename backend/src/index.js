@@ -1,18 +1,7 @@
 /**
  * AI Image Chat Backend
- * 
- * Connects:
- * 1. Frontend chat (browser) -> Express server
- * 2. Express -> LM Studio (OpenAI-compatible API)
- * 3. MCP Stability Matrix Server (stdio) for image generation
- * 
- * Flow:
- * 1. User sends message from frontend
- * 2. Backend forwards to LM Studio with tool definitions
- * 3. LM Studio may respond with text or a tool call request
- * 4. If tool call, backend asks MCP server to generate image
- * 5. Result sent back to LM Studio for final response
- * 6. Final response streamed to frontend
+ *
+ * Frontend -> Express -> OpenRouter -> MCP -> Stability Matrix
  */
 
 import express from 'express';
@@ -23,62 +12,29 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 
-// ============================================================
-// Configuration
-// ============================================================
-
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// LM Studio runs at http://localhost:1234 by default
-const LM_STUDIO_BASE = process.env.LM_STUDIO_BASE || 'http://localhost:1234';
-const LM_MODEL = process.env.LM_MODEL || ''; // Empty = let LM Studio decide
-
-// MCP server path
+const OPENROUTER_BASE = process.env.OPENROUTER_BASE || 'https://openrouter.ai/api/v1';
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'mistralai/mistral-nemo';
 const MCP_SERVER_PATH = process.env.MCP_SERVER_PATH || path.resolve(__dirname, '../../mcp-server-stability');
-
-// Server config
 const PORT = process.env.PORT || 3001;
-
-// Conversation history (keep last N messages)
 const MAX_HISTORY = 50;
-
-// ============================================================
-// State
-// ============================================================
 
 let mcpProcess = null;
 let mcpReady = false;
-let pendingRequests = new Map(); // requestId -> { resolve, reject }
+const pendingRequests = new Map();
 
-// ============================================================
-// MCP Server Management
-// ============================================================
-
-/**
- * Start the MCP Stability Matrix server as a child process
- */
 function startMCPServer() {
   return new Promise((resolve, reject) => {
     try {
-      // Check if we should use the built version or run via ts-node / tsx
       const distPath = path.join(MCP_SERVER_PATH, 'dist', 'index.js');
       const srcPath = path.join(MCP_SERVER_PATH, 'src', 'index.ts');
-
-      let cmd;
-      let args;
-
-      if (fs.existsSync(distPath)) {
-        cmd = 'node';
-        args = [distPath];
-      } else {
-        // Use npx tsx to run TypeScript directly
-        cmd = 'npx';
-        args = ['tsx', srcPath];
-      }
+      const cmd = fs.existsSync(distPath) ? 'node' : 'npx';
+      const args = fs.existsSync(distPath) ? [distPath] : ['tsx', srcPath];
 
       console.log(`[MCP] Starting server: ${cmd} ${args.join(' ')}`);
-
       mcpProcess = spawn(cmd, args, {
         cwd: MCP_SERVER_PATH,
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -91,36 +47,24 @@ function startMCPServer() {
       });
 
       let buffer = '';
-
       mcpProcess.stdout.on('data', (data) => {
-        const chunk = data.toString();
-        buffer += chunk;
-
-        // Try to parse complete JSON-RPC messages (separated by newlines)
+        buffer += data.toString();
         const lines = buffer.split('\n');
-        buffer = lines.pop() || ''; // Keep incomplete line in buffer
-
+        buffer = lines.pop() || '';
         for (const line of lines) {
-          if (line.trim()) {
-            try {
-              const message = JSON.parse(line);
-              handleMCPMessage(message);
-            } catch (e) {
-              // Not JSON - might be a log line on stderr
-              console.log(`[MCP:stdout] ${line}`);
-            }
-          }
+          if (!line.trim()) continue;
+          try { handleMCPMessage(JSON.parse(line)); }
+          catch { console.log(`[MCP:stdout] ${line}`); }
         }
       });
 
       mcpProcess.stderr.on('data', (data) => {
         const msg = data.toString().trim();
-        if (msg) {
-          console.log(`[MCP:stderr] ${msg}`);
-          if (msg.includes('running on stdio') || msg.includes('Server running')) {
-            mcpReady = true;
-            resolve();
-          }
+        if (!msg) return;
+        console.log(`[MCP:stderr] ${msg}`);
+        if (msg.includes('running on stdio') || msg.includes('Server running')) {
+          mcpReady = true;
+          resolve();
         }
       });
 
@@ -128,93 +72,51 @@ function startMCPServer() {
         console.log(`[MCP] Process exited with code ${code}`);
         mcpReady = false;
         mcpProcess = null;
-        // Reject all pending requests
-        for (const [id, { reject }] of pendingRequests) {
-          reject(new Error('MCP server process exited unexpectedly'));
+        for (const { reject: rejectPending } of pendingRequests.values()) {
+          rejectPending(new Error('MCP server process exited unexpectedly'));
         }
         pendingRequests.clear();
       });
+      mcpProcess.on('error', reject);
 
-      mcpProcess.on('error', (err) => {
-        console.error(`[MCP] Process error:`, err);
-        reject(err);
-      });
-
-      // Timeout after 15 seconds
       setTimeout(() => {
         if (!mcpReady) {
-          // Even if we don't get the ready message, try to continue
           console.log('[MCP] No ready message received, but continuing...');
           mcpReady = true;
           resolve();
         }
       }, 15000);
-
-    } catch (error) {
-      reject(error);
-    }
+    } catch (error) { reject(error); }
   });
 }
 
-/**
- * Send a JSON-RPC message to the MCP server
- */
 function sendMCPMessage(message) {
-  if (!mcpProcess || !mcpProcess.stdin) {
-    throw new Error('MCP server is not running');
-  }
-  const json = JSON.stringify(message) + '\n';
-  mcpProcess.stdin.write(json);
+  if (!mcpProcess?.stdin) throw new Error('MCP server is not running');
+  mcpProcess.stdin.write(JSON.stringify(message) + '\n');
 }
 
-/**
- * Handle incoming JSON-RPC messages from MCP server
- */
 function handleMCPMessage(message) {
-  // Check if this is a response to a pending request
   if (message.id !== undefined && pendingRequests.has(message.id)) {
     const { resolve } = pendingRequests.get(message.id);
     pendingRequests.delete(message.id);
-
-    if (message.error) {
-      resolve({ error: message.error });
-    } else {
-      resolve(message.result || message);
-    }
+    resolve(message.error ? { error: message.error } : (message.result || message));
     return;
   }
-
-  // Log unhandled messages
   console.log(`[MCP:message] ${JSON.stringify(message)}`);
 }
 
-/**
- * Call the MCP server's generate_image tool
- */
 async function callMCPGenerateImage(params) {
+  if (!mcpProcess) await startMCPServer();
   const requestId = uuidv4();
-
   return new Promise((resolve, reject) => {
     pendingRequests.set(requestId, { resolve, reject });
-
-    const message = {
-      jsonrpc: '2.0',
-      id: requestId,
-      method: 'tools/call',
-      params: {
-        name: 'generate_image',
-        arguments: params,
-      },
-    };
-
     try {
-      sendMCPMessage(message);
+      sendMCPMessage({ jsonrpc: '2.0', id: requestId, method: 'tools/call', params: { name: 'generate_image', arguments: params } });
     } catch (error) {
       pendingRequests.delete(requestId);
       reject(error);
+      return;
     }
-
-    // Timeout after 5 minutes (image generation can be slow)
     setTimeout(() => {
       if (pendingRequests.has(requestId)) {
         pendingRequests.delete(requestId);
@@ -224,410 +126,211 @@ async function callMCPGenerateImage(params) {
   });
 }
 
-// ============================================================
-// LM Studio API Calls
-// ============================================================
-
-/**
- * Get the list of available models from LM Studio
- */
-async function getLMModels() {
-  try {
-    const response = await fetch(`${LM_STUDIO_BASE}/v1/models`);
-    if (!response.ok) return [];
-    const data = await response.json();
-    return data.data || [];
-  } catch (error) {
-    console.error('[LM] Failed to get models:', error.message);
-    return [];
-  }
-}
-
-/**
- * Send a chat completion request to LM Studio with tool support
- */
-async function* streamLMStudioChat(messages, tools = null) {
-  const url = `${LM_STUDIO_BASE}/v1/chat/completions`;
-
+async function* streamOpenRouterChat(messages, tools = null) {
+  if (!OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY is not set');
   const body = {
-    model: LM_MODEL || undefined,
-    messages: messages,
+    model: OPENROUTER_MODEL,
+    messages,
     stream: true,
     temperature: 0.7,
     max_tokens: 4096,
   };
-
   if (tools) {
     body.tools = tools;
     body.tool_choice = 'auto';
   }
 
-  console.log(`[LM] Sending request with ${messages.length} messages, tools: ${!!tools}`);
-
-  const response = await fetch(url, {
+  console.log(`[OpenRouter] model=${OPENROUTER_MODEL}, messages=${messages.length}, tools=${!!tools}`);
+  const response = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+      'HTTP-Referer': process.env.OPENROUTER_SITE_URL || 'http://localhost:5500',
+      'X-Title': process.env.OPENROUTER_APP_NAME || 'AI Image Chat',
+    },
     body: JSON.stringify(body),
   });
+  if (!response.ok) throw new Error(`OpenRouter API error (${response.status}): ${await response.text()}`);
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`LM Studio API error (${response.status}): ${errorText}`);
-  }
-
-  // Parse the SSE stream
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
-
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
-
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split('\n');
     buffer = lines.pop() || '';
-
     for (const line of lines) {
       const trimmed = line.trim();
       if (!trimmed || trimmed === 'data: [DONE]') continue;
-
-      if (trimmed.startsWith('data: ')) {
-        try {
-          const jsonData = JSON.parse(trimmed.slice(6));
-          yield jsonData;
-        } catch (e) {
-          // Skip malformed JSON
-          console.warn('[LM] Failed to parse SSE line:', trimmed.substring(0, 100));
-        }
-      }
+      if (!trimmed.startsWith('data: ')) continue;
+      try { yield JSON.parse(trimmed.slice(6)); }
+      catch { console.warn('[OpenRouter] Failed to parse SSE line:', trimmed.substring(0, 120)); }
     }
   }
 }
-
-// ============================================================
-// Tool Definitions
-// ============================================================
 
 const IMAGE_GENERATION_TOOL = {
   type: 'function',
   function: {
     name: 'generate_image',
-    description: 'Generate an image using Stable Diffusion. Use this when the user asks you to create, generate, or draw an image.',
+    description: 'Generate an image using Stable Diffusion. Use this when the user asks to create, generate, draw, or make an image.',
     parameters: {
       type: 'object',
       properties: {
-        prompt: {
-          type: 'string',
-          description: 'Detailed text description of the image to generate. Should be in English for best results.',
-        },
-        negative_prompt: {
-          type: 'string',
-          description: 'Things to avoid in the image',
-        },
-        width: {
-          type: 'number',
-          description: 'Image width (default: 512, must be multiple of 64)',
-          default: 512,
-        },
-        height: {
-          type: 'number',
-          description: 'Image height (default: 512, must be multiple of 64)',
-          default: 512,
-        },
-        steps: {
-          type: 'number',
-          description: 'Quality steps (20-50, higher = better but slower)',
-          default: 20,
-        },
+        prompt: { type: 'string', description: 'Detailed English Stable Diffusion prompt.' },
+        negative_prompt: { type: 'string', description: 'Things to avoid in the image.' },
+        width: { type: 'number', default: 512 },
+        height: { type: 'number', default: 512 },
+        steps: { type: 'number', default: 20 },
       },
       required: ['prompt'],
     },
   },
 };
 
-// System prompt that tells the LLM about its image generation capability
 const SYSTEM_PROMPT = `You are a helpful AI assistant with the ability to generate images.
-
-You have access to a \`generate_image\` tool that creates images using Stable Diffusion.
-
-WHEN TO USE THE TOOL:
-- When the user asks you to create, generate, draw, or make an image
-- When the user describes a scene they want to see
-- When the user asks for a visual representation of something
-
-HOW TO USE IT:
-- Call the \`generate_image\` function with a detailed English prompt
-- The prompt should describe what you want to see in detail
-- You can optionally specify width, height, and other parameters
-
-IMPORTANT:
-- When the user asks for an image in a language other than English, translate the prompt to English before sending it
-- After generating, you'll receive the result and can show it to the user
-- You can enhance/improve the user's prompt to get better results`;
-
-// ============================================================
-// Express Server
-// ============================================================
+Use the generate_image tool when the user asks you to create, generate, draw, make, or visually depict an image.
+Translate non-English image requests into a detailed English Stable Diffusion prompt before calling the tool.
+You may improve the prompt while preserving the user's intent.`;
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
-
-// Store conversation histories: sessionId -> messages[]
 const conversations = new Map();
 
-/**
- * POST /api/chat - Send a message and get a streamed response
- */
 app.post('/api/chat', async (req, res) => {
   try {
     const { message, session_id } = req.body;
-
-    if (!message || typeof message !== 'string') {
-      return res.status(400).json({ error: 'Message is required' });
-    }
-
+    if (!message || typeof message !== 'string') return res.status(400).json({ error: 'Message is required' });
     const sessionId = session_id || 'default';
-
-    // Get or create conversation history
-    if (!conversations.has(sessionId)) {
-      conversations.set(sessionId, [
-        { role: 'system', content: SYSTEM_PROMPT },
-      ]);
-    }
-
+    if (!conversations.has(sessionId)) conversations.set(sessionId, [{ role: 'system', content: SYSTEM_PROMPT }]);
     const history = conversations.get(sessionId);
-
-    // Add user message
     history.push({ role: 'user', content: message });
+    while (history.length > MAX_HISTORY) history.splice(1, 1);
 
-    // Trim history if needed
-    while (history.length > MAX_HISTORY) {
-      // Keep the system prompt
-      const systemMsg = history[0];
-      history.splice(1, 1);
-      history[0] = systemMsg;
-    }
-
-    // Set SSE headers
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
 
-    let assistantMessage = '';
-
-    // Main conversation loop - we may need multiple rounds for tool calls
     let currentMessages = [...history];
+    let finalAssistantMessage = '';
 
-    for (let round = 0; round < 5; round++) { // Max 5 tool call rounds
-      const stream = streamLMStudioChat(currentMessages, [IMAGE_GENERATION_TOOL]);
-
-      let hasToolCall = false;
-      let toolCallData = null;
-
-      for await (const chunk of stream) {
+    for (let round = 0; round < 5; round++) {
+      let roundText = '';
+      const toolCalls = new Map();
+      for await (const chunk of streamOpenRouterChat(currentMessages, [IMAGE_GENERATION_TOOL])) {
         const delta = chunk.choices?.[0]?.delta;
-
         if (!delta) continue;
-
-        // Check for tool calls
-        if (delta.tool_calls) {
-          hasToolCall = true;
-          for (const tc of delta.tool_calls) {
-            if (tc.function?.name) {
-              toolCallData = toolCallData || { name: tc.function.name, arguments: '' };
-              toolCallData.name = tc.function.name;
-            }
-            if (tc.function?.arguments) {
-              toolCallData = toolCallData || { name: '', arguments: '' };
-              toolCallData.arguments += tc.function.arguments;
-            }
-          }
-        }
-
-        // Handle text content
         if (delta.content) {
-          assistantMessage += delta.content;
-          // Stream to client
+          roundText += delta.content;
           res.write(`data: ${JSON.stringify({ type: 'text', content: delta.content })}\n\n`);
+        }
+        for (const tc of delta.tool_calls || []) {
+          const index = tc.index ?? 0;
+          const existing = toolCalls.get(index) || { id: '', name: '', arguments: '' };
+          if (tc.id) existing.id = tc.id;
+          if (tc.function?.name) existing.name = tc.function.name;
+          if (tc.function?.arguments) existing.arguments += tc.function.arguments;
+          toolCalls.set(index, existing);
         }
       }
 
-      // If there was a tool call, execute it
-      if (hasToolCall && toolCallData) {
-        // Stream the tool call notification
-        res.write(`data: ${JSON.stringify({ type: 'tool_call', tool: toolCallData.name, arguments: toolCallData.arguments })}\n\n`);
+      if (toolCalls.size === 0) {
+        finalAssistantMessage += roundText;
+        history.push({ role: 'assistant', content: finalAssistantMessage });
+        break;
+      }
 
-        console.log(`[Tool] Calling ${toolCallData.name} with arguments: ${toolCallData.arguments}`);
+      const calls = [...toolCalls.values()];
+      currentMessages.push({
+        role: 'assistant',
+        content: roundText || null,
+        tool_calls: calls.map((tc) => ({
+          id: tc.id || `call_${uuidv4().slice(0, 8)}`,
+          type: 'function',
+          function: { name: tc.name, arguments: tc.arguments },
+        })),
+      });
 
-        // Add assistant message with tool call to history
-        currentMessages.push({
-          role: 'assistant',
-          content: null,
-          tool_calls: [{
-            id: `call_${uuidv4().slice(0, 8)}`,
-            type: 'function',
-            function: {
-              name: toolCallData.name,
-              arguments: toolCallData.arguments,
-            },
-          }],
-        });
-
-        // Parse arguments
+      for (let i = 0; i < calls.length; i++) {
+        const tc = calls[i];
+        const toolCallId = currentMessages[currentMessages.length - 1].tool_calls[i].id;
+        res.write(`data: ${JSON.stringify({ type: 'tool_call', tool: tc.name, arguments: tc.arguments })}\n\n`);
         let parsedArgs;
-        try {
-          parsedArgs = JSON.parse(toolCallData.arguments);
-        } catch (e) {
-          parsedArgs = { prompt: toolCallData.arguments };
-        }
+        try { parsedArgs = JSON.parse(tc.arguments); }
+        catch { parsedArgs = { prompt: tc.arguments }; }
 
-        // Execute via MCP
+        let toolResult;
         try {
           const result = await callMCPGenerateImage(parsedArgs);
-
-          let toolResult;
           if (result.error) {
             toolResult = `Error: ${result.error.message || JSON.stringify(result.error)}`;
             res.write(`data: ${JSON.stringify({ type: 'tool_result', success: false, error: toolResult })}\n\n`);
           } else {
-            // Extract text and image contents
-            const textParts = result.content
-              ?.filter(c => c.type === 'text')
-              .map(c => c.text) || [];
-            const imageParts = result.content
-              ?.filter(c => c.type === 'image')
-              .map(c => ({
-                type: 'image',
-                data: c.data.substring(0, 100) + '...', // Truncate for display
-              })) || [];
-
-            toolResult = textParts.join('\n');
-
-            if (imageParts.length > 0) {
-              // Send image data to frontend
-              for (const img of result.content.filter(c => c.type === 'image')) {
-                res.write(`data: ${JSON.stringify({ type: 'image', data: img.data, mimeType: img.mimeType })}\n\n`);
-              }
+            const textParts = result.content?.filter((c) => c.type === 'text').map((c) => c.text) || [];
+            toolResult = textParts.join('\n') || 'Image generated successfully.';
+            for (const img of result.content?.filter((c) => c.type === 'image') || []) {
+              res.write(`data: ${JSON.stringify({ type: 'image', data: img.data, mimeType: img.mimeType })}\n\n`);
             }
-
-            res.write(`data: ${JSON.stringify({ type: 'tool_result', success: true, result: toolResult, imageCount: imageParts.length })}\n\n`);
+            res.write(`data: ${JSON.stringify({ type: 'tool_result', success: true, result: toolResult })}\n\n`);
           }
-
-          // Add tool result to conversation
-          currentMessages.push({
-            role: 'tool',
-            tool_call_id: `call_${uuidv4().slice(0, 8)}`,
-            content: toolResult,
-          });
-
-          // Continue the loop - LM Studio will generate a follow-up response
-
         } catch (error) {
-          const errorMsg = `Tool execution error: ${error.message}`;
-          res.write(`data: ${JSON.stringify({ type: 'tool_result', success: false, error: errorMsg })}\n\n`);
-
-          currentMessages.push({
-            role: 'tool',
-            tool_call_id: `call_${uuidv4().slice(0, 8)}`,
-            content: errorMsg,
-          });
+          toolResult = `Tool execution error: ${error.message}`;
+          res.write(`data: ${JSON.stringify({ type: 'tool_result', success: false, error: toolResult })}\n\n`);
         }
-      } else {
-        // No tool call - this is the final response
-        // Add to conversation history
-        history.push({ role: 'assistant', content: assistantMessage });
-        break;
+        currentMessages.push({ role: 'tool', tool_call_id: toolCallId, content: toolResult });
       }
     }
 
-    // Signal completion
     res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
     res.end();
-
   } catch (error) {
     console.error('[Server] Error:', error);
-    if (!res.headersSent) {
-      res.status(500).json({ error: error.message });
-    } else {
+    if (!res.headersSent) res.status(500).json({ error: error.message });
+    else {
       res.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
       res.end();
     }
   }
 });
 
-/**
- * POST /api/clear - Clear conversation history
- */
 app.post('/api/clear', (req, res) => {
-  const { session_id } = req.body;
-  const sessionId = session_id || 'default';
-
-  if (conversations.has(sessionId)) {
-    conversations.set(sessionId, [
-      { role: 'system', content: SYSTEM_PROMPT },
-    ]);
-  }
-
+  const sessionId = req.body.session_id || 'default';
+  conversations.set(sessionId, [{ role: 'system', content: SYSTEM_PROMPT }]);
   res.json({ success: true });
 });
 
-/**
- * GET /api/models - List available models
- */
-app.get('/api/models', async (req, res) => {
-  try {
-    const models = await getLMModels();
-    res.json({ models });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+app.get('/api/models', (req, res) => {
+  res.json({ models: [{ id: OPENROUTER_MODEL, object: 'model', provider: 'OpenRouter' }] });
 });
 
-/**
- * GET /api/status - Health check
- */
 app.get('/api/status', (req, res) => {
-  res.json({
-    status: 'ok',
-    mcpReady,
-    conversationsCount: conversations.size,
-    pendingRequests: pendingRequests.size,
-  });
+  res.json({ status: 'ok', provider: 'OpenRouter', model: OPENROUTER_MODEL, apiKeyConfigured: !!OPENROUTER_API_KEY, mcpReady, conversationsCount: conversations.size, pendingRequests: pendingRequests.size });
 });
-
-// ============================================================
-// Start Server
-// ============================================================
 
 async function main() {
   console.log('=== AI Image Chat Backend ===');
-  console.log(`LM Studio: ${LM_STUDIO_BASE}`);
+  console.log(`OpenRouter: ${OPENROUTER_BASE}`);
+  console.log(`Model: ${OPENROUTER_MODEL}`);
+  console.log(`API key: ${OPENROUTER_API_KEY ? 'configured' : 'MISSING'}`);
   console.log(`MCP Server: ${MCP_SERVER_PATH}`);
   console.log(`Port: ${PORT}`);
 
-  // Start MCP server
-  console.log('[MCP] Starting Stability Matrix MCP server...');
   try {
     await startMCPServer();
     console.log('[MCP] Server started successfully');
   } catch (error) {
     console.error('[MCP] Failed to start server:', error.message);
-    console.log('[MCP] Will retry on first image generation request');
   }
 
-  // Start Express
   app.listen(PORT, () => {
-    console.log(`\n🚀 Server running at http://localhost:${PORT}`);
-    console.log('📝 API endpoints:');
-    console.log(`   POST http://localhost:${PORT}/api/chat  - Chat with AI`);
-    console.log(`   POST http://localhost:${PORT}/api/clear - Clear history`);
-    console.log(`   GET  http://localhost:${PORT}/api/status - Health check`);
-    console.log(`   GET  http://localhost:${PORT}/api/models - List LM models`);
-    console.log('\n⚠️  Make sure LM Studio is running and a model is loaded!');
-    console.log('⚠️  Make sure Stability Matrix with AUTOMATIC1111 or ComfyUI is running!\n');
+    console.log(`\nServer running at http://localhost:${PORT}`);
+    if (!OPENROUTER_API_KEY) console.log('WARNING: Set OPENROUTER_API_KEY before chatting.');
+    console.log('Make sure Stability Matrix with AUTOMATIC1111 or ComfyUI is running.\n');
   });
 }
 
